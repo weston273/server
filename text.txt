@@ -1,0 +1,500 @@
+Generate a frontend web application using React JSX (with JavaScript and CSS) for a Raspberry Pi music recognition system. The frontend must satisfy the following requirements:
+
+Include a "Record" button that triggers audio recording via a backend service (record.js). The recording starts on button click and stops automatically after 5 seconds.
+
+Display the latest recognized song details, including: song title, recognition score, recognition method, and timestamp.
+
+Show a real-time list or table of all past recognized plays fetched from the backend (/plays endpoint).
+
+Include visual feedback during recording, such as a blinking indicator or countdown timer.
+
+Be responsive and mobile-friendly.
+
+Include basic styling with CSS, ensuring clear layout, readable fonts, and colored indicators for recording status.
+
+Automatically fetch and update the list of plays every few seconds to reflect new recognitions.
+
+Use fetch or axios for backend API communication.
+
+Handle offline situations gracefully, displaying an error message if the backend is unreachable.
+
+Ensure the frontend is ready to deploy as a static web app (HTML, CSS, JS only) and can connect to the Node.js backend for recording and data retrieval.
+
+Generate all necessary files, including:
+
+App.jsx (main React component)
+
+App.css (styling)
+
+Any other necessary React structure or helper components
+
+Ensure the code is clear, modular, and production-ready.
+
+also make sure this backend is stored in the right folders and work together with the front end : 
+record.js: const express = require("express");
+const bodyParser = require("body-parser");
+const { Pool } = require("pg"); // PostgreSQL client
+const cors = require("cors");
+
+const app = express();
+app.use(bodyParser.json());
+app.use(cors()); // Optional, allows browser access
+
+// Render PostgreSQL connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+// --- Helper: validate input ---
+function validatePlay({ song, timestamp }) {
+  if (typeof song !== "string" || !song.trim()) return "Invalid song";
+  if (!timestamp || isNaN(Date.parse(timestamp))) return "Invalid timestamp";
+  return null;
+}
+
+// --- POST /upload endpoint ---
+app.post("/upload", async (req, res) => {
+  const { song, timestamp } = req.body;
+  const error = validatePlay({ song, timestamp });
+  if (error) return res.status(400).send(error);
+
+  try {
+    await pool.query(
+      "INSERT INTO plays (song, timestamp) VALUES ($1, $2)",
+      [song.trim(), timestamp]
+    );
+    res.send("✅ Saved to cloud DB");
+  } catch (err) {
+    console.error("DB insert error:", err.message);
+    res.status(500).send("Error saving data");
+  }
+});
+
+// --- GET /plays endpoint with pagination ---
+app.get("/plays", async (req, res) => {
+  const limit = parseInt(req.query.limit) || 100;
+  try {
+    const result = await pool.query(
+      "SELECT * FROM plays ORDER BY timestamp DESC LIMIT $1",
+      [limit]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("DB read error:", err.message);
+    res.status(500).send("Error retrieving data");
+  }
+});
+
+// --- Graceful shutdown ---
+process.on("SIGINT", () => {
+  pool.end(() => {
+    console.log("DB pool closed");
+    process.exit(0);
+  });
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`Server running on port ${port}`));
+ recognize.js: const fs = require("fs");
+const path = require("path");
+const sqlite3 = require("sqlite3").verbose();
+const axios = require("axios");
+const dns = require("dns");
+const crypto = require("crypto");
+
+// ==== CONFIG ====
+// ACRCloud keys
+const ACR_HOST = "identify-eu-west-1.acrcloud.com"; 
+const ACCESS_KEY = "3fc3dafa11cb68bc7c9a9d8e25372e84";
+const ACCESS_SECRET = "Mi6mRiQWifpxkDqV18kDJXblPpZKCLv1WHP5F3xX";
+
+// Your Render backend API
+const RENDER_API = "https://your-render-app.onrender.com/upload";
+const RENDER_API_KEY = "YOUR_RENDER_KEY";
+
+// ---- Database setup ----
+const db = new sqlite3.Database("plays.db");
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS plays (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    song TEXT,
+    score REAL,
+    method TEXT,
+    synced INTEGER DEFAULT 0,
+    timestamp TEXT NOT NULL
+  )`);
+});
+
+// ---- Helper: ACRCloud Request ----
+async function acrRequest(filePath, endpoint = "/v1/identify") {
+  const buffer = fs.readFileSync(filePath);
+  const httpMethod = "POST";
+  const httpUri = endpoint;
+  const dataType = "audio";
+  const signatureVersion = "1";
+  const timestamp = Math.floor(Date.now() / 1000);
+
+  const stringToSign = [httpMethod, httpUri, ACCESS_KEY, dataType, signatureVersion, timestamp].join("\n");
+
+  const signature = crypto
+    .createHmac("sha1", ACCESS_SECRET)
+    .update(stringToSign)
+    .digest("base64");
+
+  try {
+    const res = await axios.post(`${ACR_HOST}${endpoint}`, buffer, {
+      headers: {
+        "Content-Type": "audio/wav",
+        "access-key": ACCESS_KEY,
+        "signature": signature,
+        "signature-version": signatureVersion,
+        "data-type": dataType,
+        "sample-bytes": buffer.length,
+        "timestamp": timestamp,
+      },
+    });
+    return res.data;
+  } catch (err) {
+    console.error("ACRCloud request failed:", err.message);
+    return null;
+  }
+}
+
+// ---- Pick latest recording from 'music' folder ----
+const musicDir = path.join(__dirname, 'music');
+if (!fs.existsSync(musicDir)) {
+  console.error("❌ 'music' folder not found. Run record.js first.");
+  process.exit(1);
+}
+
+const files = fs.readdirSync(musicDir)
+  .filter(f => f.endsWith('.wav'))
+  .map(f => ({
+    name: f,
+    time: fs.statSync(path.join(musicDir, f)).mtime.getTime()
+  }))
+  .sort((a, b) => b.time - a.time); // newest first
+
+if (files.length === 0) {
+  console.error("❌ No recordings found in 'music' folder.");
+  process.exit(1);
+}
+
+const testFile = path.join(musicDir, files[0].name); // newest file
+console.log(`🎶 Recognizing latest recording: ${files[0].name}`);
+
+// ---- Recognition logic ----
+(async () => {
+  // Try fingerprinting first
+  let result = await acrRequest(testFile, "/v1/identify");
+  let method = "fingerprinting";
+
+  // If no match, try humming
+  if (!result || !result.metadata || !result.metadata.music || result.metadata.music.length === 0) {
+    console.log("🎤 Fingerprinting failed, trying humming...");
+    result = await acrRequest(testFile, "/v1/identifyHumming");
+    method = "humming";
+  }
+
+  if (result && result.metadata && result.metadata.music && result.metadata.music.length > 0) {
+    const song = result.metadata.music[0].title;
+    const score = result.metadata.music[0].score || 0;
+
+    console.log(`✅ Recognized: ${song} (method: ${method}, score: ${score})`);
+
+    // Log locally
+    db.run(
+      `INSERT INTO plays (song, score, method, timestamp) VALUES (?, ?, ?, ?)`,
+      [song, score, method, new Date().toISOString()],
+      async (err) => {
+        if (err) console.error("DB insert error:", err.message);
+        else {
+          console.log("📥 Logged locally.");
+          await syncNewPlays(); // Sync new unsynced plays
+        }
+      }
+    );
+  } else {
+    console.log("❌ No match found.");
+    await syncNewPlays();
+  }
+})();
+
+// ---- Sync unsynced plays to Render ----
+async function syncNewPlays() {
+  dns.lookup("google.com", async (err) => {
+    if (err) {
+      console.log("📴 Offline. Will sync later.");
+      db.close();
+      return;
+    }
+
+    console.log("🌍 Internet detected. Syncing new plays...");
+
+    const db2 = new sqlite3.Database("plays.db");
+    db2.all("SELECT * FROM plays WHERE synced = 0", async (err, rows) => {
+      if (err) {
+        console.error("DB read error:", err.message);
+        db2.close();
+        return;
+      }
+
+      for (const play of rows) {
+        try {
+          const res = await axios.post(RENDER_API, {
+            song: play.song,
+            score: play.score,
+            method: play.method,
+            timestamp: play.timestamp,
+          }, {
+            headers: { Authorization: `Bearer ${RENDER_API_KEY}` }
+          });
+
+          if (res.status === 200) {
+            db2.run("UPDATE plays SET synced = 1 WHERE id = ?", [play.id]);
+            console.log(`✅ Synced: ${play.song}`);
+          }
+        } catch (err) {
+          console.error("Sync error:", err.message);
+        }
+      }
+
+      db2.close();
+    });
+  });
+}
+recognize.js : const fs = require("fs");
+const path = require("path");
+const sqlite3 = require("sqlite3").verbose();
+const axios = require("axios");
+const dns = require("dns");
+const crypto = require("crypto");
+
+// ==== CONFIG ====
+// ACRCloud keys
+const ACR_HOST = "identify-eu-west-1.acrcloud.com"; 
+const ACCESS_KEY = "3fc3dafa11cb68bc7c9a9d8e25372e84";
+const ACCESS_SECRET = "Mi6mRiQWifpxkDqV18kDJXblPpZKCLv1WHP5F3xX";
+
+// Your Render backend API
+const RENDER_API = "https://your-render-app.onrender.com/upload";
+const RENDER_API_KEY = "YOUR_RENDER_KEY";
+
+// ---- Database setup ----
+const db = new sqlite3.Database("plays.db");
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS plays (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    song TEXT,
+    score REAL,
+    method TEXT,
+    synced INTEGER DEFAULT 0,
+    timestamp TEXT NOT NULL
+  )`);
+});
+
+// ---- Helper: ACRCloud Request ----
+async function acrRequest(filePath, endpoint = "/v1/identify") {
+  const buffer = fs.readFileSync(filePath);
+  const httpMethod = "POST";
+  const httpUri = endpoint;
+  const dataType = "audio";
+  const signatureVersion = "1";
+  const timestamp = Math.floor(Date.now() / 1000);
+
+  const stringToSign = [httpMethod, httpUri, ACCESS_KEY, dataType, signatureVersion, timestamp].join("\n");
+
+  const signature = crypto
+    .createHmac("sha1", ACCESS_SECRET)
+    .update(stringToSign)
+    .digest("base64");
+
+  try {
+    const res = await axios.post(`${ACR_HOST}${endpoint}`, buffer, {
+      headers: {
+        "Content-Type": "audio/wav",
+        "access-key": ACCESS_KEY,
+        "signature": signature,
+        "signature-version": signatureVersion,
+        "data-type": dataType,
+        "sample-bytes": buffer.length,
+        "timestamp": timestamp,
+      },
+    });
+    return res.data;
+  } catch (err) {
+    console.error("ACRCloud request failed:", err.message);
+    return null;
+  }
+}
+
+// ---- Pick latest recording from 'music' folder ----
+const musicDir = path.join(__dirname, 'music');
+if (!fs.existsSync(musicDir)) {
+  console.error("❌ 'music' folder not found. Run record.js first.");
+  process.exit(1);
+}
+
+const files = fs.readdirSync(musicDir)
+  .filter(f => f.endsWith('.wav'))
+  .map(f => ({
+    name: f,
+    time: fs.statSync(path.join(musicDir, f)).mtime.getTime()
+  }))
+  .sort((a, b) => b.time - a.time); // newest first
+
+if (files.length === 0) {
+  console.error("❌ No recordings found in 'music' folder.");
+  process.exit(1);
+}
+
+const testFile = path.join(musicDir, files[0].name); // newest file
+console.log(`🎶 Recognizing latest recording: ${files[0].name}`);
+
+// ---- Recognition logic ----
+(async () => {
+  // Try fingerprinting first
+  let result = await acrRequest(testFile, "/v1/identify");
+  let method = "fingerprinting";
+
+  // If no match, try humming
+  if (!result || !result.metadata || !result.metadata.music || result.metadata.music.length === 0) {
+    console.log("🎤 Fingerprinting failed, trying humming...");
+    result = await acrRequest(testFile, "/v1/identifyHumming");
+    method = "humming";
+  }
+
+  if (result && result.metadata && result.metadata.music && result.metadata.music.length > 0) {
+    const song = result.metadata.music[0].title;
+    const score = result.metadata.music[0].score || 0;
+
+    console.log(`✅ Recognized: ${song} (method: ${method}, score: ${score})`);
+
+    // Log locally
+    db.run(
+      `INSERT INTO plays (song, score, method, timestamp) VALUES (?, ?, ?, ?)`,
+      [song, score, method, new Date().toISOString()],
+      async (err) => {
+        if (err) console.error("DB insert error:", err.message);
+        else {
+          console.log("📥 Logged locally.");
+          await syncNewPlays(); // Sync new unsynced plays
+        }
+      }
+    );
+  } else {
+    console.log("❌ No match found.");
+    await syncNewPlays();
+  }
+})();
+
+// ---- Sync unsynced plays to Render ----
+async function syncNewPlays() {
+  dns.lookup("google.com", async (err) => {
+    if (err) {
+      console.log("📴 Offline. Will sync later.");
+      db.close();
+      return;
+    }
+
+    console.log("🌍 Internet detected. Syncing new plays...");
+
+    const db2 = new sqlite3.Database("plays.db");
+    db2.all("SELECT * FROM plays WHERE synced = 0", async (err, rows) => {
+      if (err) {
+        console.error("DB read error:", err.message);
+        db2.close();
+        return;
+      }
+
+      for (const play of rows) {
+        try {
+          const res = await axios.post(RENDER_API, {
+            song: play.song,
+            score: play.score,
+            method: play.method,
+            timestamp: play.timestamp,
+          }, {
+            headers: { Authorization: `Bearer ${RENDER_API_KEY}` }
+          });
+
+          if (res.status === 200) {
+            db2.run("UPDATE plays SET synced = 1 WHERE id = ?", [play.id]);
+            console.log(`✅ Synced: ${play.song}`);
+          }
+        } catch (err) {
+          console.error("Sync error:", err.message);
+        }
+      }
+
+      db2.close();
+    });
+  });
+}
+servers.js : const express = require("express");
+const bodyParser = require("body-parser");
+const { Pool } = require("pg"); // PostgreSQL client
+const cors = require("cors");
+
+const app = express();
+app.use(bodyParser.json());
+app.use(cors()); // Optional, allows browser access
+
+// Render PostgreSQL connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+// --- Helper: validate input ---
+function validatePlay({ song, timestamp }) {
+  if (typeof song !== "string" || !song.trim()) return "Invalid song";
+  if (!timestamp || isNaN(Date.parse(timestamp))) return "Invalid timestamp";
+  return null;
+}
+
+// --- POST /upload endpoint ---
+app.post("/upload", async (req, res) => {
+  const { song, timestamp } = req.body;
+  const error = validatePlay({ song, timestamp });
+  if (error) return res.status(400).send(error);
+
+  try {
+    await pool.query(
+      "INSERT INTO plays (song, timestamp) VALUES ($1, $2)",
+      [song.trim(), timestamp]
+    );
+    res.send("✅ Saved to cloud DB");
+  } catch (err) {
+    console.error("DB insert error:", err.message);
+    res.status(500).send("Error saving data");
+  }
+});
+
+// --- GET /plays endpoint with pagination ---
+app.get("/plays", async (req, res) => {
+  const limit = parseInt(req.query.limit) || 100;
+  try {
+    const result = await pool.query(
+      "SELECT * FROM plays ORDER BY timestamp DESC LIMIT $1",
+      [limit]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error("DB read error:", err.message);
+    res.status(500).send("Error retrieving data");
+  }
+});
+
+// --- Graceful shutdown ---
+process.on("SIGINT", () => {
+  pool.end(() => {
+    console.log("DB pool closed");
+    process.exit(0);
+  });
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`Server running on port ${port}`));
+
